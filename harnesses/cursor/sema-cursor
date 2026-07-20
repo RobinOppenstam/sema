@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""Sema ref gate — Tier 3 Cursor CLI wrapper that gates prompts through sema check.
+
+Thin shim over ``sema.cli.main check``: gathers prompt text from argv and/or
+stdin, verdicts content-addressed refs (Handle#stub) against the active sema
+registry, then invokes ``cursor-agent`` (or ``$SEMA_CURSOR_AGENT``).
+
+Tier 3 shim: Cursor's hook machinery exists (including Claude Code-compat config
+loading), but hook dispatch is currently server-gated off. When in-harness hooks
+take over, this wrapper becomes optional.
+
+Verdicts mirror ``sema.core.check``:
+
+  KNOWN   handle exists, stub matches      -> pass
+  STALE   handle exists, stub differs      -> BLOCK in enforce (exit 2)
+  UNKNOWN handle not in registry           -> note on stderr, never block
+          (the regex can match non-sema text like "PR#12ab")
+
+Modes (SEMA_REF_GATE):
+  off      disable entirely — exec cursor-agent immediately
+  warn     detect stale refs and inject a model-visible warning, never block (default)
+  enforce  block STALE refs (exit 2) with the repair message
+"""
+
+import json
+import os
+import subprocess
+import sys
+
+MODE = os.environ.get("SEMA_REF_GATE", "warn").lower()
+AGENT = os.environ.get("SEMA_CURSOR_AGENT", "cursor-agent")
+PYTHON = os.environ.get("SEMA_PYTHON", "python3")
+
+
+def run_check(gate_text: str) -> dict | None:
+    """Run ``sema check --json`` on gate_text; return the verdict doc or None on failure."""
+    cmd = [PYTHON, "-m", "sema.cli.main", "check", "--json"]
+    db = os.environ.get("SEMA_REF_GATE_DB")
+    if db:
+        cmd.extend(["--db", db])
+    try:
+        result = subprocess.run(
+            cmd,
+            input=gate_text,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        print("sema-cursor: registry unavailable, gate skipped", file=sys.stderr)
+        return None
+
+    if result.returncode not in (0, 3):
+        print("sema-cursor: registry unavailable, gate skipped", file=sys.stderr)
+        return None
+
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        print("sema-cursor: registry unavailable, gate skipped", file=sys.stderr)
+        return None
+
+
+def append_verdict_log(doc: dict) -> None:
+    log_path = os.environ.get("SEMA_REF_GATE_LOG")
+    if not log_path:
+        return
+    try:
+        with open(log_path, "a") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "mode": MODE,
+                        "refs": [r["ref"] for r in doc["refs"]],
+                        "stale": [r["ref"] for r in doc["stale"]],
+                        "unknown": [r["ref"] for r in doc["unknown"]],
+                        "blocked": bool(doc["stale"]) and MODE == "enforce",
+                    }
+                )
+                + "\n"
+            )
+    except OSError:
+        pass
+
+
+def invoke_agent(args: list[str], stdin_piped: bool, stdin_content: str) -> None:
+    if stdin_piped:
+        result = subprocess.run([AGENT, *args], input=stdin_content, text=True)
+        sys.exit(result.returncode)
+    os.execvp(AGENT, [AGENT, *args])
+
+
+def apply_warn_injection(
+    repair: str, args: list[str], stdin_piped: bool, stdin_content: str
+) -> tuple[list[str], str, bool]:
+    """Prepend a stale-ref warning to the prompt; return (args, stdin, use_subprocess)."""
+    prefix = f"[sema-ref-gate warning]\n{repair}\n\n"
+    # Piped-but-empty stdin (e.g. </dev/null in headless runs) is not the
+    # prompt channel — only inject there when it actually carries content.
+    if stdin_piped and stdin_content.strip():
+        return args, prefix + stdin_content, True
+    if args and not args[-1].startswith("-"):
+        return [*args[:-1], prefix + args[-1]], stdin_content, False
+    print(
+        "sema-cursor: warn injection skipped (could not identify the prompt argument)",
+        file=sys.stderr,
+    )
+    return args, stdin_content, stdin_piped
+
+
+def main() -> None:
+    args = sys.argv[1:]
+
+    if MODE == "off":
+        invoke_agent(args, False, "")
+
+    stdin_piped = not sys.stdin.isatty()
+
+    if not args and not stdin_piped:
+        invoke_agent(args, False, "")
+
+    stdin_content = sys.stdin.read() if stdin_piped else ""
+
+    gate_text = "\n".join(args)
+    if stdin_piped:
+        if gate_text:
+            gate_text += "\n"
+        gate_text += stdin_content
+
+    doc = run_check(gate_text)
+    if doc is None:
+        invoke_agent(args, stdin_piped, stdin_content)
+
+    append_verdict_log(doc)
+
+    unknown_ref_strings = [r["ref"] for r in doc["unknown"]]
+    if unknown_ref_strings:
+        print(
+            "sema-cursor: unrecognized refs (not in the active vocabulary): "
+            + ", ".join(unknown_ref_strings)
+            + ". If these are sema refs, verify with sema_handshake before relying on them.",
+            file=sys.stderr,
+        )
+
+    if doc["stale"]:
+        if MODE == "enforce":
+            print("sema-cursor: BLOCKED — " + doc["repair"], file=sys.stderr)
+            sys.exit(2)
+        if MODE == "warn":
+            args, stdin_content, stdin_piped = apply_warn_injection(
+                doc["repair"], args, stdin_piped, stdin_content
+            )
+
+    invoke_agent(args, stdin_piped, stdin_content)
+
+
+if __name__ == "__main__":
+    main()
